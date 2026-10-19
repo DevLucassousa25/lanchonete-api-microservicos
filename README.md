@@ -1,4 +1,4 @@
-# Lanchonete API — microserviços em Laravel
+# Lanchonete API — microserviços em Laravel (Primeiro contato com microservicos)
 
 API REST para cardápio online e pedidos de uma lanchonete, pensada para ser consumida por
 **qualquer aplicação** (app mobile, site, totem, parceiro). Sem front-end acoplado.
