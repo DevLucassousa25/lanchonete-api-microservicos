@@ -1,0 +1,661 @@
+openapi: 3.0.3
+info:
+  title: Lanchonete API
+  version: 1.0.0
+  description: |
+    API de cardápio e pedidos de uma lanchonete, construída em **microserviços Laravel**
+    (contas, catálogo, pedidos, pagamentos) atrás de um gateway Nginx.
+
+    ## Autenticação
+    1. Cadastre-se em `POST /api/auth/registrar` ou faça login em `POST /api/auth/login`.
+    2. Envie o token em todas as rotas protegidas: `Authorization: Bearer <access_token>`.
+    3. O token expira (padrão 60 min). Renove com `POST /api/auth/refresh` antes de expirar.
+
+    Perfis: **cliente** (se cadastra sozinho, faz pedidos) e **admin** (catálogo, preços, cozinha, clientes).
+
+    ## Convenções
+    - Valores monetários sempre em **centavos** (inteiro). `preco` é só a versão formatada.
+    - Pedidos são identificados pelo `codigo` (UUID).
+    - Erros: `{"message": "..."}`; validação (422) traz também `errors` por campo.
+    - Listas paginadas trazem `data`, `current_page`, `last_page`, `per_page`, `total` (ou `meta`/`links`).
+
+    ## Fluxo de um pedido
+    `POST /api/pedidos` → status `aguardando_pagamento` → consulte o Pix em `GET /api/pagamentos/{codigo}`
+    (pode levar 1–2s para existir) → após o pagamento o pedido vira `pago` →
+    cozinha avança `em_preparo` → `pronto` → `entregue`. Pagamento recusado → `cancelado`.
+servers:
+  - url: http://localhost:8080
+    description: Docker local
+
+tags:
+  - name: Autenticação
+  - name: Perfil
+  - name: Endereços
+  - name: Catálogo (público)
+  - name: Catálogo (admin)
+  - name: Preços (admin)
+  - name: Pedidos
+  - name: Pagamentos
+  - name: Cozinha (admin)
+  - name: Clientes (admin)
+
+paths:
+  # ------------------------------------------------------------ Autenticação
+  /api/auth/registrar:
+    post:
+      tags: [Autenticação]
+      summary: Cadastrar cliente
+      description: Cria a conta (perfil cliente) e já devolve o token. Limite de 10 cadastros/min por IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegistroInput' }
+      responses:
+        '201': { description: Conta criada, content: { application/json: { schema: { $ref: '#/components/schemas/Token' } } } }
+        '422': { $ref: '#/components/responses/Validacao' }
+        '429': { $ref: '#/components/responses/MuitasTentativas' }
+  /api/auth/login:
+    post:
+      tags: [Autenticação]
+      summary: Login
+      description: Limite de 5 tentativas/min por e-mail + IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, senha]
+              properties:
+                email: { type: string, format: email, example: maria@email.com }
+                senha: { type: string, example: segredo123 }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Token' } } } }
+        '401': { $ref: '#/components/responses/NaoAutenticado' }
+        '429': { $ref: '#/components/responses/MuitasTentativas' }
+  /api/auth/refresh:
+    post:
+      tags: [Autenticação]
+      summary: Renovar token
+      description: Devolve um token novo e revoga o atual.
+      security: [{ bearer: [] }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Token' } } } }
+        '401': { $ref: '#/components/responses/NaoAutenticado' }
+  /api/auth/logout:
+    post:
+      tags: [Autenticação]
+      summary: Logout
+      description: Revoga o token em **todos** os serviços até a expiração dele.
+      security: [{ bearer: [] }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Mensagem' } } } }
+        '401': { $ref: '#/components/responses/NaoAutenticado' }
+
+  # ------------------------------------------------------------ Perfil
+  /api/me:
+    get:
+      tags: [Perfil]
+      summary: Meus dados (com endereços)
+      security: [{ bearer: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/Usuario'
+                      - type: object
+                        properties:
+                          enderecos: { type: array, items: { $ref: '#/components/schemas/Endereco' } }
+        '401': { $ref: '#/components/responses/NaoAutenticado' }
+    patch:
+      tags: [Perfil]
+      summary: Atualizar meus dados
+      description: Envie só os campos que mudaram. Nome/telefone dentro do token só mudam no próximo login ou refresh.
+      security: [{ bearer: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nome: { type: string, example: Maria Souza }
+                email: { type: string, format: email }
+                telefone: { type: string, example: '85999990000' }
+                cpf: { type: string, example: '12345678901', description: '11 dígitos, sem pontuação' }
+                data_nascimento: { type: string, format: date, example: '1995-04-20' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Usuario' }, message: { type: string } } } } } }
+        '422': { $ref: '#/components/responses/Validacao' }
+  /api/me/senha:
+    put:
+      tags: [Perfil]
+      summary: Alterar senha
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [senha_atual, nova_senha, nova_senha_confirmation]
+              properties:
+                senha_atual: { type: string }
+                nova_senha: { type: string, minLength: 8 }
+                nova_senha_confirmation: { type: string }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Mensagem' } } } }
+        '422': { $ref: '#/components/responses/Validacao' }
+
+  # ------------------------------------------------------------ Endereços
+  /api/me/enderecos:
+    get:
+      tags: [Endereços]
+      summary: Listar meus endereços
+      security: [{ bearer: [] }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Endereco' } } } } } } }
+    post:
+      tags: [Endereços]
+      summary: Cadastrar endereço
+      description: O primeiro endereço vira principal automaticamente.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/EnderecoInput' } } }
+      responses:
+        '201': { description: Criado, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Endereco' } } } } } }
+        '422': { $ref: '#/components/responses/Validacao' }
+  /api/me/enderecos/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+    get:
+      tags: [Endereços]
+      summary: Ver endereço
+      security: [{ bearer: [] }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Endereco' } } } } } }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+    patch:
+      tags: [Endereços]
+      summary: Atualizar endereço
+      security: [{ bearer: [] }]
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/EnderecoInput' } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Endereco' } } } } } }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+    delete:
+      tags: [Endereços]
+      summary: Remover endereço
+      security: [{ bearer: [] }]
+      responses:
+        '204': { description: Removido }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+
+  # ------------------------------------------------------------ Catálogo público
+  /api/cardapio:
+    get:
+      tags: [Catálogo (público)]
+      summary: Cardápio completo
+      description: Categorias com produtos disponíveis e preço vigente. Cache de até 60s.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        nome: { type: string, example: Lanches }
+                        produtos: { type: array, items: { $ref: '#/components/schemas/Produto' } }
+  /api/categorias:
+    get:
+      tags: [Catálogo (público)]
+      summary: Listar categorias
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Categoria' } } } } } } }
+    post:
+      tags: [Catálogo (admin)]
+      summary: Criar categoria
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CategoriaInput' } } }
+      responses:
+        '201': { description: Criada, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Categoria' } } } } } }
+        '403': { $ref: '#/components/responses/Proibido' }
+        '422': { $ref: '#/components/responses/Validacao' }
+  /api/categorias/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+    get:
+      tags: [Catálogo (público)]
+      summary: Ver categoria
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Categoria' } } } } } }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+    patch:
+      tags: [Catálogo (admin)]
+      summary: Atualizar categoria
+      security: [{ bearer: [] }]
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/CategoriaInput' } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Categoria' } } } } } }
+        '403': { $ref: '#/components/responses/Proibido' }
+    delete:
+      tags: [Catálogo (admin)]
+      summary: Remover categoria
+      description: Só é permitido se não houver produtos ativos nela.
+      security: [{ bearer: [] }]
+      responses:
+        '204': { description: Removida }
+        '409': { $ref: '#/components/responses/Conflito' }
+  /api/produtos:
+    get:
+      tags: [Catálogo (público)]
+      summary: Listar produtos (paginado)
+      parameters:
+        - { name: categoria_id, in: query, schema: { type: integer } }
+        - { name: busca, in: query, schema: { type: string }, description: Busca por nome }
+        - { name: disponivel, in: query, schema: { type: boolean } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ProdutosPaginados' } } } }
+    post:
+      tags: [Catálogo (admin)]
+      summary: Criar produto (com preço inicial)
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ProdutoInput'
+                - type: object
+                  required: [categoria_id, nome, preco_centavos]
+                  properties:
+                    preco_centavos: { type: integer, example: 2800, description: Preço inicial }
+      responses:
+        '201': { description: Criado, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Produto' } } } } } }
+        '403': { $ref: '#/components/responses/Proibido' }
+        '422': { $ref: '#/components/responses/Validacao' }
+  /api/produtos/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+    get:
+      tags: [Catálogo (público)]
+      summary: Ver produto
+      description: Inclui `proximo_preco` quando há reajuste agendado.
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Produto' } } } } } }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+    patch:
+      tags: [Catálogo (admin)]
+      summary: Atualizar produto
+      description: Dados cadastrais. **O preço não muda aqui** — use `POST /api/produtos/{id}/precos`.
+      security: [{ bearer: [] }]
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProdutoInput' } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Produto' } } } } } }
+        '403': { $ref: '#/components/responses/Proibido' }
+    delete:
+      tags: [Catálogo (admin)]
+      summary: Remover produto
+      description: Remoção lógica — pedidos e histórico de preços continuam íntegros.
+      security: [{ bearer: [] }]
+      responses:
+        '204': { description: Removido }
+
+  # ------------------------------------------------------------ Preços
+  /api/produtos/{id}/precos:
+    parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+    get:
+      tags: [Preços (admin)]
+      summary: Tabela/histórico de preços do produto
+      security: [{ bearer: [] }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Preco' } } } } } } }
+    post:
+      tags: [Preços (admin)]
+      summary: Novo preço (imediato ou agendado)
+      description: Sem `inicio_vigencia` vale a partir de agora. Com data futura, entra em vigor sozinho na data.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [valor_centavos]
+              properties:
+                valor_centavos: { type: integer, example: 3000 }
+                inicio_vigencia: { type: string, format: date-time, example: '2026-12-01 00:00:00' }
+                motivo: { type: string, example: Reajuste de fim de ano }
+      responses:
+        '201': { description: Criado, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Preco' } } } } } }
+        '422': { $ref: '#/components/responses/Validacao' }
+  /api/produtos/{id}/precos/{precoId}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer } }
+      - { name: precoId, in: path, required: true, schema: { type: integer } }
+    delete:
+      tags: [Preços (admin)]
+      summary: Cancelar preço agendado
+      description: Só preços futuros podem ser removidos (histórico é imutável).
+      security: [{ bearer: [] }]
+      responses:
+        '204': { description: Cancelado }
+        '409': { $ref: '#/components/responses/Conflito' }
+
+  # ------------------------------------------------------------ Pedidos
+  /api/pedidos:
+    get:
+      tags: [Pedidos]
+      summary: Meus pedidos (admin vê todos)
+      security: [{ bearer: [] }]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/StatusPedido' } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: per_page, in: query, schema: { type: integer, default: 20 } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Pedido' } }, total: { type: integer }, current_page: { type: integer } } } } } }
+    post:
+      tags: [Pedidos]
+      summary: Fazer pedido
+      description: |
+        O preço vem sempre do catálogo (nunca do cliente). Para delivery, informe um `endereco_id`
+        da sua conta — o endereço é copiado para o pedido. Depois, consulte o Pix em `GET /api/pagamentos/{codigo}`.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tipo_entrega, itens]
+              properties:
+                tipo_entrega: { type: string, enum: [retirada, delivery] }
+                endereco_id: { type: integer, description: Obrigatório para delivery }
+                observacao: { type: string, example: Tocar o interfone 2x }
+                itens:
+                  type: array
+                  items:
+                    type: object
+                    required: [produto_id, quantidade]
+                    properties:
+                      produto_id: { type: integer, example: 2 }
+                      quantidade: { type: integer, minimum: 1, maximum: 20, example: 1 }
+                      observacao: { type: string, example: Sem cebola }
+      responses:
+        '201': { description: Criado, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Pedido' } } } } } }
+        '422': { $ref: '#/components/responses/Validacao' }
+  /api/pedidos/{codigo}:
+    parameters: [{ name: codigo, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Pedidos]
+      summary: Acompanhar pedido
+      description: Só o dono do pedido ou admin.
+      security: [{ bearer: [] }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Pedido' } } } } } }
+        '403': { $ref: '#/components/responses/Proibido' }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+
+  # ------------------------------------------------------------ Pagamentos
+  /api/pagamentos/{codigo}:
+    parameters: [{ name: codigo, in: path, required: true, schema: { type: string, format: uuid }, description: Código do pedido }]
+    get:
+      tags: [Pagamentos]
+      summary: Pix do pedido (QR code / copia e cola)
+      description: |
+        Gerado de forma assíncrona: logo após criar o pedido pode responder 404 por 1–2s — tente de novo.
+        Só o dono do pedido ou admin.
+      security: [{ bearer: [] }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Pagamento' } } } } } }
+        '403': { $ref: '#/components/responses/Proibido' }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+  /api/webhooks/pix:
+    post:
+      tags: [Pagamentos]
+      summary: Webhook do provedor de pagamento
+      description: |
+        Chamado pelo Mercado Pago (`{"type":"order","data":{"id":"ORD..."}}`) — o status é sempre
+        reconsultado na API do provedor. No modo `fake`, use `{"gateway_id":"fake_xxx","status":"aprovado"}`.
+      requestBody:
+        content: { application/json: { schema: { type: object } } }
+      responses:
+        '200': { description: Recebido }
+
+  # ------------------------------------------------------------ Cozinha
+  /api/cozinha:
+    get:
+      tags: [Cozinha (admin)]
+      summary: Fila da cozinha (só pedidos pagos)
+      security: [{ bearer: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      pago: { type: array, items: { $ref: '#/components/schemas/Pedido' } }
+                      em_preparo: { type: array, items: { $ref: '#/components/schemas/Pedido' } }
+                      pronto: { type: array, items: { $ref: '#/components/schemas/Pedido' } }
+  /api/pedidos/{codigo}/avancar:
+    parameters: [{ name: codigo, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      tags: [Cozinha (admin)]
+      summary: Avançar status (pago → em_preparo → pronto → entregue)
+      security: [{ bearer: [] }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Pedido' } } } } } }
+        '409': { $ref: '#/components/responses/Conflito' }
+
+  # ------------------------------------------------------------ Clientes
+  /api/clientes:
+    get:
+      tags: [Clientes (admin)]
+      summary: Listar clientes
+      security: [{ bearer: [] }]
+      parameters:
+        - { name: busca, in: query, schema: { type: string }, description: 'Nome, e-mail ou telefone' }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: per_page, in: query, schema: { type: integer, default: 20 } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Usuario' } }, total: { type: integer } } } } } }
+        '403': { $ref: '#/components/responses/Proibido' }
+  /api/clientes/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+    get:
+      tags: [Clientes (admin)]
+      summary: Ver cliente (com endereços)
+      security: [{ bearer: [] }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Usuario' } } } } } }
+        '404': { $ref: '#/components/responses/NaoEncontrado' }
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+
+  responses:
+    NaoAutenticado: { description: 'Token ausente, inválido, expirado ou revogado', content: { application/json: { schema: { $ref: '#/components/schemas/Mensagem' } } } }
+    Proibido: { description: 'Sem permissão (ex.: cliente em rota de admin, ou recurso de outro cliente)', content: { application/json: { schema: { $ref: '#/components/schemas/Mensagem' } } } }
+    NaoEncontrado: { description: Não encontrado, content: { application/json: { schema: { $ref: '#/components/schemas/Mensagem' } } } }
+    Conflito: { description: Operação não permitida no estado atual, content: { application/json: { schema: { $ref: '#/components/schemas/Mensagem' } } } }
+    MuitasTentativas: { description: Limite de requisições atingido, content: { application/json: { schema: { $ref: '#/components/schemas/Mensagem' } } } }
+    Validacao:
+      description: Erro de validação
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
+              errors: { type: object, additionalProperties: { type: array, items: { type: string } }, example: { email: ['The email has already been taken.'] } }
+
+  schemas:
+    Mensagem:
+      type: object
+      properties: { message: { type: string } }
+    RegistroInput:
+      type: object
+      required: [nome, email, senha, senha_confirmation, telefone]
+      properties:
+        nome: { type: string, example: Maria Souza }
+        email: { type: string, format: email, example: maria@email.com }
+        senha: { type: string, minLength: 8, example: segredo123 }
+        senha_confirmation: { type: string, example: segredo123 }
+        telefone: { type: string, example: '85999990000' }
+        cpf: { type: string, example: '12345678901' }
+        data_nascimento: { type: string, format: date }
+    Token:
+      type: object
+      properties:
+        access_token: { type: string, example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9... }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer, example: 3600, description: Segundos }
+        usuario: { $ref: '#/components/schemas/Usuario' }
+    Usuario:
+      type: object
+      properties:
+        id: { type: integer }
+        nome: { type: string }
+        email: { type: string }
+        papel: { type: string, enum: [cliente, admin] }
+        telefone: { type: string }
+        cpf: { type: string, nullable: true }
+        data_nascimento: { type: string, format: date, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    EnderecoInput:
+      type: object
+      required: [cep, logradouro, numero, bairro, cidade, uf]
+      properties:
+        apelido: { type: string, example: Casa }
+        cep: { type: string, example: '60000000', description: 8 dígitos }
+        logradouro: { type: string, example: Rua das Flores }
+        numero: { type: string, example: '123' }
+        complemento: { type: string, example: Apto 2 }
+        bairro: { type: string, example: Centro }
+        cidade: { type: string, example: Fortaleza }
+        uf: { type: string, example: CE }
+        referencia: { type: string, example: Perto da praça }
+        principal: { type: boolean }
+    Endereco:
+      allOf:
+        - $ref: '#/components/schemas/EnderecoInput'
+        - type: object
+          properties:
+            id: { type: integer }
+            texto: { type: string, example: 'Rua das Flores, 123 (Apto 2) - Centro, Fortaleza/CE - CEP 60000-000' }
+    CategoriaInput:
+      type: object
+      properties:
+        nome: { type: string, example: Sobremesas }
+        ordem: { type: integer, example: 3 }
+    Categoria:
+      type: object
+      properties:
+        id: { type: integer }
+        nome: { type: string }
+        ordem: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ProdutoInput:
+      type: object
+      properties:
+        categoria_id: { type: integer, example: 1 }
+        nome: { type: string, example: X-Bacon }
+        descricao: { type: string, example: 'Pão, carne 120g, bacon e queijo' }
+        imagem_url: { type: string, format: uri }
+        disponivel: { type: boolean }
+    Produto:
+      type: object
+      properties:
+        id: { type: integer }
+        categoria_id: { type: integer }
+        nome: { type: string }
+        descricao: { type: string }
+        imagem_url: { type: string, nullable: true }
+        disponivel: { type: boolean }
+        preco_centavos: { type: integer, example: 2800, description: Preço vigente }
+        preco: { type: string, example: '28,00' }
+        proximo_preco:
+          type: object
+          nullable: true
+          properties:
+            valor_centavos: { type: integer }
+            inicio_vigencia: { type: string, format: date-time }
+        categoria: { type: object, properties: { id: { type: integer }, nome: { type: string } } }
+    ProdutosPaginados:
+      type: object
+      properties:
+        data: { type: array, items: { $ref: '#/components/schemas/Produto' } }
+        links: { type: object }
+        meta: { type: object, properties: { current_page: { type: integer }, last_page: { type: integer }, total: { type: integer } } }
+    Preco:
+      type: object
+      properties:
+        id: { type: integer }
+        valor_centavos: { type: integer }
+        inicio_vigencia: { type: string, format: date-time }
+        motivo: { type: string, nullable: true }
+        situacao: { type: string, enum: [vigente, agendado, historico] }
+    StatusPedido:
+      type: string
+      enum: [aguardando_pagamento, pago, em_preparo, pronto, entregue, cancelado]
+    Pedido:
+      type: object
+      properties:
+        codigo: { type: string, format: uuid }
+        cliente_id: { type: integer }
+        cliente_nome: { type: string }
+        cliente_telefone: { type: string }
+        tipo_entrega: { type: string, enum: [retirada, delivery] }
+        endereco: { type: string, nullable: true }
+        observacao: { type: string, nullable: true }
+        total_centavos: { type: integer }
+        status: { $ref: '#/components/schemas/StatusPedido' }
+        created_at: { type: string, format: date-time }
+        itens:
+          type: array
+          items:
+            type: object
+            properties:
+              produto_id: { type: integer }
+              nome_produto: { type: string }
+              preco_unitario_centavos: { type: integer }
+              quantidade: { type: integer }
+              observacao: { type: string, nullable: true }
+    Pagamento:
+      type: object
+      properties:
+        pedido_codigo: { type: string, format: uuid }
+        valor_centavos: { type: integer }
+        metodo: { type: string, example: pix }
+        gateway: { type: string, enum: [fake, mercadopago] }
+        status: { type: string, enum: [pendente, aprovado, recusado] }
+        pix_copia_e_cola: { type: string }
+        qr_code_base64: { type: string, nullable: true, description: PNG em base64 }
+        ticket_url: { type: string, nullable: true }

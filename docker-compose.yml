@@ -1,0 +1,202 @@
+# Subir tudo:   docker compose up -d --build
+# API:          http://localhost:8080/api/...
+# Docs:         http://localhost:8080/docs   (Swagger UI)
+# RabbitMQ UI:  http://localhost:15672 (guest/guest)
+#
+# Variáveis sensíveis vêm do arquivo .env na raiz (ver .env.example).
+
+x-php: &php
+  restart: unless-stopped
+
+x-common-env: &common-env
+  DB_CONNECTION: pgsql
+  DB_PORT: 5432
+  DB_USERNAME: app
+  DB_PASSWORD: secret
+  REDIS_HOST: redis
+  REDIS_PREFIX: "lanchonete:"        # mesmo prefixo em todos: tokens revogados são compartilhados
+  CACHE_STORE: redis
+  RABBITMQ_HOST: rabbitmq
+  LOG_CHANNEL: stderr
+  APP_DEBUG: ${APP_DEBUG:-false}     # true mostra stack trace nos erros (só para depurar)
+  JWT_SECRET: ${JWT_SECRET:-troque-este-segredo-em-producao-0123456789abcdef}
+  JWT_TTL_MINUTOS: ${JWT_TTL_MINUTOS:-60}
+
+x-healthcheck: &healthcheck
+  test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:8000/up') === false ? 1 : 0);"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 10s
+
+x-pg-health: &pg-health
+  test: ["CMD-SHELL", "pg_isready -U app -d $${POSTGRES_DB}"]   # sem -d ele tenta o banco "app" e loga FATAL
+  interval: 3s
+  retries: 20
+
+services:
+  # ---------- Entrada ----------
+  gateway:
+    image: nginx:1.27-alpine
+    ports: ["8080:80"]
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./docs:/usr/share/nginx/docs:ro
+    depends_on:
+      contas: { condition: service_healthy }
+      catalogo: { condition: service_healthy }
+      pedidos: { condition: service_healthy }
+      pagamentos: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ---------- Contas (clientes, login JWT, perfil, endereços) ----------
+  contas:
+    <<: *php
+    build: { context: ., dockerfile: docker/php/Dockerfile, args: { SERVICE: contas } }
+    environment:
+      <<: *common-env
+      APP_KEY: base64:K8h+3CP1qR9G2sFvoyFpztl2XWbgRSBxUUXHZXarFo0=
+      DB_HOST: contas-db
+      DB_DATABASE: contas
+      RUN_MIGRATIONS: "1"
+      RUN_SEED: "1"
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@lanchonete.dev}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin12345}
+    healthcheck: *healthcheck
+    depends_on:
+      contas-db: { condition: service_healthy }
+      redis: { condition: service_started }
+  contas-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: contas, POSTGRES_USER: app, POSTGRES_PASSWORD: secret }
+    volumes: ["contas-data:/var/lib/postgresql/data"]
+    healthcheck: *pg-health
+
+  # ---------- Catálogo (categorias, produtos, preços) ----------
+  catalogo:
+    <<: *php
+    build: { context: ., dockerfile: docker/php/Dockerfile, args: { SERVICE: catalogo } }
+    environment:
+      <<: *common-env
+      APP_KEY: base64:SJNNWCieFShjBB8sP05VEqJqKVNGmzIGJMeEoiMb7kA=
+      DB_HOST: catalogo-db
+      DB_DATABASE: catalogo
+      RUN_MIGRATIONS: "1"
+      RUN_SEED: "1"
+    healthcheck: *healthcheck
+    depends_on:
+      catalogo-db: { condition: service_healthy }
+      redis: { condition: service_started }
+  catalogo-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: catalogo, POSTGRES_USER: app, POSTGRES_PASSWORD: secret }
+    volumes: ["catalogo-data:/var/lib/postgresql/data"]
+    healthcheck: *pg-health
+
+  # ---------- Pedidos ----------
+  pedidos:
+    <<: *php
+    build: { context: ., dockerfile: docker/php/Dockerfile, args: { SERVICE: pedidos } }
+    environment: &pedidos-env
+      <<: *common-env
+      APP_KEY: base64:hqW9sxqFHj/14JENEWmcE19s4nXvil3bBW9es3+epJE=
+      DB_HOST: pedidos-db
+      DB_DATABASE: pedidos
+      CATALOGO_URL: http://catalogo:8000
+      CONTAS_URL: http://contas:8000
+      RUN_MIGRATIONS: "1"
+    healthcheck: *healthcheck
+    depends_on:
+      pedidos-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      redis: { condition: service_started }
+  pedidos-worker:              # consome pagamento.aprovado / pagamento.recusado
+    <<: *php
+    build: { context: ., dockerfile: docker/php/Dockerfile, args: { SERVICE: pedidos } }
+    command: ["php", "artisan", "eventos:consumir"]
+    environment:
+      <<: *pedidos-env
+      RUN_MIGRATIONS: "0"
+    depends_on:
+      pedidos: { condition: service_healthy }   # garante migrations rodadas
+      rabbitmq: { condition: service_healthy }
+  pedidos-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: pedidos, POSTGRES_USER: app, POSTGRES_PASSWORD: secret }
+    volumes: ["pedidos-data:/var/lib/postgresql/data"]
+    healthcheck: *pg-health
+
+  # ---------- Pagamentos ----------
+  pagamentos:
+    <<: *php
+    build: { context: ., dockerfile: docker/php/Dockerfile, args: { SERVICE: pagamentos } }
+    environment: &pagamentos-env
+      <<: *common-env
+      APP_KEY: base64:wku4fHjODombozqutBJ11VQ92iGdlmktA4anVdcAjT0=
+      DB_HOST: pagamentos-db
+      DB_DATABASE: pagamentos
+      RUN_MIGRATIONS: "1"
+      PAGAMENTO_GATEWAY: ${PAGAMENTO_GATEWAY:-fake}
+      MERCADOPAGO_ACCESS_TOKEN: ${MERCADOPAGO_ACCESS_TOKEN:-}
+      MERCADOPAGO_TEST_PAYER_NAME: ${MERCADOPAGO_TEST_PAYER_NAME:-}
+      MERCADOPAGO_NOTIFICATION_URL: ${MERCADOPAGO_NOTIFICATION_URL:-}
+    healthcheck: *healthcheck
+    depends_on:
+      pagamentos-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      redis: { condition: service_started }
+  pagamentos-worker:           # consome pedido.criado → gera o Pix
+    <<: *php
+    build: { context: ., dockerfile: docker/php/Dockerfile, args: { SERVICE: pagamentos } }
+    command: ["php", "artisan", "eventos:consumir"]
+    environment:
+      <<: *pagamentos-env
+      RUN_MIGRATIONS: "0"
+    depends_on:
+      pagamentos: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+  pagamentos-scheduler:        # a cada 10s confere no provedor os Pix pendentes
+    <<: *php
+    build: { context: ., dockerfile: docker/php/Dockerfile, args: { SERVICE: pagamentos } }
+    command: ["php", "artisan", "schedule:work"]
+    environment:
+      <<: *pagamentos-env
+      RUN_MIGRATIONS: "0"
+    depends_on:
+      pagamentos: { condition: service_healthy }
+  pagamentos-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: pagamentos, POSTGRES_USER: app, POSTGRES_PASSWORD: secret }
+    volumes: ["pagamentos-data:/var/lib/postgresql/data"]
+    healthcheck: *pg-health
+
+  # ---------- Infra compartilhada ----------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    hostname: rabbitmq          # nome do nó fixo (rabbit@rabbitmq)
+    ports: ["15672:15672"]
+    ulimits:                    # Docker Desktop usa um limite enorme que derruba o Erlang
+      nofile: { soft: 65536, hard: 65536 }
+    restart: unless-stopped
+    volumes: ["rabbitmq-data:/var/lib/rabbitmq"]
+    healthcheck:
+      # Não usar rabbitmq-diagnostics aqui: ele roda como root e, se executar antes do
+      # broker subir, cria /var/lib/rabbitmq/.erlang.cookie como root -> o servidor
+      # (usuário rabbitmq) não consegue ler o cookie (eacces) e o boot falha.
+      # A UI de gestão só responde depois que o broker terminou de subir.
+      # 127.0.0.1 (e não localhost): no Alpine "localhost" resolve para ::1 e o wget falha
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:15672/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+volumes:
+  contas-data:
+  catalogo-data:
+  pedidos-data:
+  pagamentos-data:
+  rabbitmq-data:

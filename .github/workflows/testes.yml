@@ -1,0 +1,31 @@
+# Roda a suíte de testes de cada microserviço a cada push / pull request.
+name: Testes
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  phpunit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        servico: [contas, catalogo, pedidos, pagamentos]
+    defaults:
+      run:
+        working-directory: services/${{ matrix.servico }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite, sockets, bcmath, redis
+          coverage: none
+
+      - name: Instalar dependências
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: PHPUnit (${{ matrix.servico }})
+        run: vendor/bin/phpunit

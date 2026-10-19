@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+         cacheDirectory=".phpunit.cache">
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>app</directory>
+        </include>
+    </source>
+    <!-- Testes isolados: SQLite em memória, sem Redis, sem RabbitMQ, sem rede -->
+    <php>
+        <env name="APP_ENV" value="testing" force="true"/>
+        <env name="APP_KEY" value="base64:dGVzdGVzLWxhbmNob25ldGUtMzItYnl0ZXMtYWJjZGU=" force="true"/>
+        <env name="APP_DEBUG" value="false" force="true"/>
+        <env name="DB_CONNECTION" value="sqlite" force="true"/>
+        <env name="DB_DATABASE" value=":memory:" force="true"/>
+        <env name="CACHE_STORE" value="array" force="true"/>
+        <env name="SESSION_DRIVER" value="array" force="true"/>
+        <env name="QUEUE_CONNECTION" value="sync" force="true"/>
+        <env name="LOG_CHANNEL" value="null" force="true"/>
+        <env name="JWT_SECRET" value="segredo-dos-testes-0123456789abcdef0123456789" force="true"/>
+        <env name="JWT_REVOGACAO_STORE" value="array" force="true"/>
+        <env name="PAGAMENTO_GATEWAY" value="fake" force="true"/>
+        <env name="CATALOGO_URL" value="http://catalogo.test" force="true"/>
+        <env name="CONTAS_URL" value="http://contas.test" force="true"/>
+        <env name="BCRYPT_ROUNDS" value="4" force="true"/>
+    </php>
+</phpunit>
